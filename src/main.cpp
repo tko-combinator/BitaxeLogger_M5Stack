@@ -1,4 +1,5 @@
 #include <M5Unified.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -7,12 +8,15 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
+// NVS情報
+Preferences preferences;
+
 // WiFi接続情報
 char ssid[50];
 char password[100];
 
 // NTP情報
-#define JST 3600 * 9
+#define GMT_OFFSET_SEC 3600 * 9 // JST
 #define SUMMER_TIME_OFFSET 0
 char NTP_url[100];
 
@@ -57,41 +61,72 @@ bool setConfig()
 
     if (!file)
     {
-        Serial.println("Failed to open config.json");
-        return false;
+        Serial.println("Failed to open config.json. Initializing from NVM...");
+
+        if (preferences.begin("config", true))
+        { 
+            strlcpy(ssid, preferences.getString("ssid", "").c_str(), sizeof(ssid));
+            strlcpy(password, preferences.getString("password", "").c_str(), sizeof(password));
+            strlcpy(NTP_url, preferences.getString("NTP_url", "").c_str(), sizeof(NTP_url));
+            strlcpy(Bitaxe_url, preferences.getString("Bitaxe_url", "").c_str(), sizeof(Bitaxe_url));
+            strlcpy(InfluxDB_url, preferences.getString("InfluxDB_url", "").c_str(), sizeof(InfluxDB_url));
+            strlcpy(InfluxDB_org, preferences.getString("InfluxDB_org", "").c_str(), sizeof(InfluxDB_org));
+            strlcpy(InfluxDB_bucket, preferences.getString("InfluxDB_bucket", "").c_str(), sizeof(InfluxDB_bucket));
+            strlcpy(InfluxDB_token, preferences.getString("InfluxDB_token", "").c_str(), sizeof(InfluxDB_token));
+
+            preferences.end(); 
+            return true;
+
+        } else {
+            Serial.println("Failed to initialize NVM.");
+            return false;
+        }
     }
-
-    Serial.println("config.json opened successfully");
-
-    String jsonString;
-    while (file.available())
+    else
     {
-        jsonString += char(file.read());
+        Serial.println("config.json opened successfully");
+        String jsonString;
+        while (file.available())
+        {
+            jsonString += char(file.read());
+        }
+
+        file.close();
+        // Serial.println(jsonString);
+        DynamicJsonDocument doc(2048);
+        DeserializationError error = deserializeJson(doc, jsonString);
+
+        if (error)
+        {
+            Serial.println("Failed to parse JSON");
+            Serial.println(error.c_str());
+            return false;
+        }
+
+        Serial.println("JSON parsing succeeded!");
+        strlcpy(ssid, doc["wifi"]["ssid"], sizeof(ssid));
+        strlcpy(password, doc["wifi"]["password"], sizeof(password));
+        strlcpy(NTP_url, doc["ntp"]["url"], sizeof(NTP_url));
+        strlcpy(Bitaxe_url, doc["bitaxe"]["url"], sizeof(Bitaxe_url));
+        strlcpy(InfluxDB_url, doc["influxdb"]["url"], sizeof(InfluxDB_url));
+        strlcpy(InfluxDB_org, doc["influxdb"]["org"], sizeof(InfluxDB_org));
+        strlcpy(InfluxDB_bucket, doc["influxdb"]["bucket"], sizeof(InfluxDB_bucket));
+        strlcpy(InfluxDB_token, doc["influxdb"]["token"], sizeof(InfluxDB_token));
+
+        preferences.begin("config", false);
+        preferences.putString("ssid", ssid);
+        preferences.putString("password", password);
+        preferences.putString("NTP_url", NTP_url);
+        preferences.putString("Bitaxe_url", Bitaxe_url);
+        preferences.putString("InfluxDB_url", InfluxDB_url);
+        preferences.putString("InfluxDB_org", InfluxDB_org);
+        preferences.putString("InfluxDB_bucket", InfluxDB_bucket);
+        preferences.putString("InfluxDB_token", InfluxDB_token);
+        preferences.end();
+
+        Serial.println("Data written to NVM from config.json");
+        return true;
     }
-    file.close();
-    // Serial.println(jsonString);
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, jsonString);
-
-    if (error)
-    {
-        Serial.println("Failed to parse JSON");
-        Serial.println(error.c_str());
-        return false;
-    }
-
-    Serial.println("JSON parsing succeeded!");
-
-    strlcpy(ssid, doc["wifi"]["ssid"], sizeof(ssid));
-    strlcpy(password, doc["wifi"]["password"], sizeof(password));
-    strlcpy(NTP_url, doc["ntp"]["url"], sizeof(NTP_url));
-    strlcpy(Bitaxe_url, doc["bitaxe"]["url"], sizeof(Bitaxe_url));
-    strlcpy(InfluxDB_url, doc["influxdb"]["url"], sizeof(InfluxDB_url));
-    strlcpy(InfluxDB_org, doc["influxdb"]["org"], sizeof(InfluxDB_org));
-    strlcpy(InfluxDB_bucket, doc["influxdb"]["bucket"], sizeof(InfluxDB_bucket));
-    strlcpy(InfluxDB_token, doc["influxdb"]["token"], sizeof(InfluxDB_token));
-
-    return true;
 }
 
 void printError(String message)
@@ -139,7 +174,7 @@ void initNTP()
 {
     if (WiFi.status() == WL_CONNECTED)
     {
-        configTime(JST, SUMMER_TIME_OFFSET, NTP_url);
+        configTime(GMT_OFFSET_SEC, SUMMER_TIME_OFFSET, NTP_url);
         Serial.println("Time synchronized with NTP server.");
     }
     else
@@ -356,6 +391,11 @@ float _getTemp_BM18B20(DeviceAddress sensorAddress)
     return temp;
 }
 
+void initTempSensers()
+{
+    _init_BM18B20();
+}
+
 TempData getTempData()
 {
     TempData data;
@@ -373,8 +413,7 @@ void setup()
     Serial.begin(115200);
     Serial.println("M5Stack nitialized.");
     setConfig();
-
-    _init_BM18B20();
+    initTempSensers();
     LcdInit();
     WiFiInit();
     M5.Display.println("WiFi: OK");
