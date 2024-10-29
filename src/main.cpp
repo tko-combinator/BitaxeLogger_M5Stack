@@ -5,8 +5,12 @@
 #include <ArduinoJson.h>
 #include <SD.h>
 #include <time.h>
+#include <Wire.h>
+#include <Adafruit_MCP9600.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+
+#define GROVE_ADDRESS 0x60
 
 // NVS情報
 Preferences preferences;
@@ -14,6 +18,8 @@ Preferences preferences;
 // WiFi接続情報
 char ssid[50];
 char password[100];
+bool tryWiFiReconnect;
+const int maxWifiReconnect = 5;
 
 // NTP情報
 #define GMT_OFFSET_SEC 3600 * 9 // JST
@@ -28,6 +34,12 @@ char InfluxDB_url[100];
 
 // Bitaxe API情報
 char Bitaxe_url[100];
+
+// MCP9600接続情報
+Adafruit_MCP9600 mcp;
+#define MCP9600_ADDRESS_Q1 0x60
+#define MCP9600_ADDRESS_Q2 0x61
+#define MCP9600_ADDRESS_L 0x62
 
 // BM18B20接続情報
 #define ONE_WIRE_BUS 26
@@ -53,18 +65,40 @@ struct BitaxeInfo
     float current;
     float temp;
     float hashRate;
+    bool isValid;
 };
 
-bool setConfig()
+void HLT()
+{
+    Serial.println("Entering HLT...");
+    M5.Lcd.clear(WHITE);
+    M5.Lcd.setCursor(10, 50);
+    M5.Lcd.println("Entering HLT...");
+    M5.Lcd.println("Please restart.");
+    while (1)
+    {
+        delay(1000);
+    }
+}
+
+void printError(const char *errorMessage, const char *errorType = "General Error")
+{
+    Serial.print(errorType);
+    Serial.print(": ");
+    Serial.println(errorMessage);
+}
+
+void setConfig()
 {
     File file = SD.open("/config.json", FILE_READ);
+    const char *errorType = "Config Error";
 
     if (!file)
     {
         Serial.println("Failed to open config.json. Initializing from NVM...");
 
         if (preferences.begin("config", true))
-        { 
+        {
             strlcpy(ssid, preferences.getString("ssid", "").c_str(), sizeof(ssid));
             strlcpy(password, preferences.getString("password", "").c_str(), sizeof(password));
             strlcpy(NTP_url, preferences.getString("NTP_url", "").c_str(), sizeof(NTP_url));
@@ -74,12 +108,12 @@ bool setConfig()
             strlcpy(InfluxDB_bucket, preferences.getString("InfluxDB_bucket", "").c_str(), sizeof(InfluxDB_bucket));
             strlcpy(InfluxDB_token, preferences.getString("InfluxDB_token", "").c_str(), sizeof(InfluxDB_token));
 
-            preferences.end(); 
-            return true;
-
-        } else {
-            Serial.println("Failed to initialize NVM.");
-            return false;
+            preferences.end();
+        }
+        else
+        {
+            printError("Failed to initialize NVM.", errorType);
+            HLT();
         }
     }
     else
@@ -92,15 +126,14 @@ bool setConfig()
         }
 
         file.close();
-        // Serial.println(jsonString);
         DynamicJsonDocument doc(2048);
         DeserializationError error = deserializeJson(doc, jsonString);
 
         if (error)
         {
-            Serial.println("Failed to parse JSON");
+            printError("Failed to parse JSON", errorType);
             Serial.println(error.c_str());
-            return false;
+            HLT();
         }
 
         Serial.println("JSON parsing succeeded!");
@@ -125,14 +158,7 @@ bool setConfig()
         preferences.end();
 
         Serial.println("Data written to NVM from config.json");
-        return true;
     }
-}
-
-void printError(String message)
-{
-    message = "Error: " + message;
-    Serial.println(message);
 }
 
 void LcdInit()
@@ -160,14 +186,49 @@ void WiFiInit()
     Serial.println(WiFi.localIP());
 }
 
-void WiFiReconnect()
+void handleWifiReconection()
 {
-}
+    if (!tryWiFiReconnect)
+    {
+        return;
+    }
 
-void WiFiError()
-{
-    printError("WiFi not connected");
-    WiFiReconnect();
+    int attemptCount = 0;
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("Attempting WiFi reconnection...");
+        WiFi.begin(ssid, password);
+
+        while ((WiFi.status() != WL_CONNECTED) && attemptCount < maxWifiReconnect)
+        {
+            delay(1000);
+            Serial.print("Reconnect attempt ");
+            Serial.print(attemptCount + 1);
+            Serial.println("...");
+            attemptCount++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            Serial.println("WiFi reconnected successfully!");
+            Serial.print("IP Address: ");
+            Serial.println(WiFi.localIP());
+        }
+        else
+        {
+            printError("Failed to reconnect to WiFi.", "Wifi Error");
+            Serial.println("Continuing with the next operation...");
+            tryWiFiReconnect = false;
+        }
+    }
+    else
+    {
+        Serial.println("WiFi is already connected.");
+    }
+    Serial.println("\nConnected to WiFi!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
 }
 
 void initNTP()
@@ -179,7 +240,9 @@ void initNTP()
     }
     else
     {
-        WiFiError();
+        printError("Failed to initialize NTP: No network connection", "NTP Error");
+        handleWifiReconection();
+        HLT();
     }
 }
 
@@ -202,7 +265,8 @@ String getLocalTime_NTP()
     }
     else
     {
-        WiFiError();
+        printError("Cannot retrieve local time: No network connection", "NTP Error");
+        handleWifiReconection();
     }
 }
 
@@ -227,6 +291,15 @@ BitaxeInfo getBitaxeInfo()
 
             if (error)
             {
+                printError(error.c_str(), "JSON Deserialization Error");
+                info.isValid = false;
+                info.power = -1;
+                info.voltage = -1;
+                info.current = -1;
+                info.temp = -1;
+                info.hashRate = -1;
+
+                return info;
             }
 
             info.power = data["power"];
@@ -234,20 +307,20 @@ BitaxeInfo getBitaxeInfo()
             info.current = data["current"];
             info.temp = data["temp"];
             info.hashRate = data["hashRate"];
+            info.isValid = true;
 
             return info;
         }
         else
         {
-            Serial.print("Error on HTTP request: ");
-            Serial.println(httpResponseCode);
+            Serial.println(Serial.println(httpResponseCode));
         }
 
         http.end();
     }
     else
     {
-        WiFiError();
+        handleWifiReconection();
     }
 }
 
@@ -288,7 +361,8 @@ void _storeInfluxdb(TempData tempData, BitaxeInfo bitaxeInfo)
     }
     else
     {
-        Serial.print("Error on sending POST: ");
+        printError("Error on sending POST", "HTTP Error");
+        Serial.println("Response Code: " + String(httpResponseCode));
         Serial.println(httpResponseCode);
     }
 
@@ -303,7 +377,7 @@ void storeDB(TempData tempData, BitaxeInfo bitaxeInfo)
     }
     else
     {
-        WiFiError();
+        handleWifiReconection();
     }
 }
 
@@ -337,7 +411,7 @@ void storeSDCARD(TempData tempData, BitaxeInfo bitaxeInfo)
     }
     else
     {
-        Serial.println("Error opening log.csv");
+        printError("Error opening log.csv", "File Open Error");
     }
 }
 
@@ -387,13 +461,32 @@ float _getTemp_BM18B20(DeviceAddress sensorAddress)
         Serial.println("Error: Senser falt..");
         return NAN;
     }
-    Serial.println(temp);
+    return temp;
+}
+
+void _init_MCP9600()
+{
+    if (!mcp.begin(GROVE_ADDRESS))
+    {
+        printError("Failed to initialize MCP9600. Please check the connection.", "MCP9600 Initialization Error");
+    }
+}
+
+float _getTemp_MCP9600()
+{
+    float temp = mcp.readThermocouple();
+    if (isnan(temp))
+    {
+        printError("Failed to read temperature from MCP9600.", "Temperature Read Error");
+        return NAN;
+    }
     return temp;
 }
 
 void initTempSensers()
 {
     _init_BM18B20();
+    _init_MCP9600();
 }
 
 TempData getTempData()
@@ -424,9 +517,24 @@ void setup()
 void loop()
 {
     M5.update();
+    tryWiFiReconnect = true;
+    float temperature = _getTemp_MCP9600();
+    if (!isnan(temperature))
+    {
+        Serial.print("Temperature: ");
+        Serial.print(temperature);
+        Serial.println(" C");
+    }
     BitaxeInfo bitaxeInfo = getBitaxeInfo();
     TempData tempData = getTempData();
-    storeDB(tempData, bitaxeInfo);
-    storeSDCARD(tempData, bitaxeInfo);
+    if (bitaxeInfo.isValid)
+    {
+        storeDB(tempData, bitaxeInfo);
+        storeSDCARD(tempData, bitaxeInfo);
+    }
+    else
+    {
+        printError("Failed to retrieve BitaxeInfo.");
+    }
     delay(30000);
 }
