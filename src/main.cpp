@@ -1,4 +1,6 @@
 #include <M5Unified.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <Preferences.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -35,8 +37,11 @@ char InfluxDB_url[100];
 // Bitaxe API情報
 char Bitaxe_url[100];
 
-// MCP9600接続情報
-Adafruit_MCP9600 mcp;
+// MCP9600接続情報()
+Adafruit_MCP9600 mcp_Q1;
+Adafruit_MCP9600 mcp_Q2;
+Adafruit_MCP9600 mcp_L;
+
 #define MCP9600_ADDRESS_Q1 0x60
 #define MCP9600_ADDRESS_Q2 0x61
 #define MCP9600_ADDRESS_L 0x62
@@ -53,11 +58,13 @@ DeviceAddress sensorAddresses[MAX_SENSORS];
 
 struct TempData
 {
+    float amb;
     float Q1;
     float Q2;
     float L;
 };
 
+TempData tempData;
 struct BitaxeInfo
 {
     float power;
@@ -67,6 +74,8 @@ struct BitaxeInfo
     float hashRate;
     bool isValid;
 };
+
+BitaxeInfo bitaxeInfo;
 
 void HLT()
 {
@@ -464,15 +473,23 @@ float _getTemp_BM18B20(DeviceAddress sensorAddress)
     return temp;
 }
 
-void _init_MCP9600()
+bool _init_MCP9600(Adafruit_MCP9600 &mcp, int I2C_ADDRESS)
 {
-    if (!mcp.begin(GROVE_ADDRESS))
+    Serial.print("Initializing MCP9600 at address 0x");
+    Serial.println(I2C_ADDRESS, HEX);
+
+    if (!mcp.begin(I2C_ADDRESS))
     {
-        printError("Failed to initialize MCP9600. Please check the connection.", "MCP9600 Initialization Error");
+        return false;
     }
+
+    mcp.setADCresolution(MCP9600_ADCRESOLUTION_18);
+    mcp.setThermocoupleType(MCP9600_TYPE_K);
+    mcp.setFilterCoefficient(3);
+    return true;
 }
 
-float _getTemp_MCP9600()
+float _getTemp_MCP9600(Adafruit_MCP9600 &mcp)
 {
     float temp = mcp.readThermocouple();
     if (isnan(temp))
@@ -483,10 +500,24 @@ float _getTemp_MCP9600()
     return temp;
 }
 
+float _getTemp_Dummy()
+{
+    return 25.0;
+}
+
 void initTempSensers()
 {
-    _init_BM18B20();
-    _init_MCP9600();
+    _init_BM18B20();                                            // Ambient temperature
+    bool status_Q1 = _init_MCP9600(mcp_Q1, MCP9600_ADDRESS_Q1); // MOSFET Q1
+    bool status_Q2 = _init_MCP9600(mcp_Q2, MCP9600_ADDRESS_Q2); // MOSFET Q2
+    bool status_L = _init_MCP9600(mcp_L, MCP9600_ADDRESS_L);    // Iinductor L
+
+    if (!status_Q1 || !status_Q2 || !status_L)
+    {
+        printError("One or more temperature sensors failed to initialize.", "Initialization Error");
+    }
+
+    Serial.println("All temperature sensors initialized successfully.");
 }
 
 TempData getTempData()
@@ -498,6 +529,33 @@ TempData getTempData()
     return data;
 }
 
+void loggingTask(void *pvParameters)
+{
+    while (true)
+    {
+        bitaxeInfo = getBitaxeInfo();
+        tempData = getTempData();
+        if (bitaxeInfo.isValid)
+        {
+            storeDB(tempData, bitaxeInfo);
+            storeSDCARD(tempData, bitaxeInfo);
+        }
+        else
+        {
+            printError("Failed to retrieve valid BitaxeInfo.", "Data Retrieval Error");
+        }
+        vTaskDelay(15000 / portTICK_PERIOD_MS);
+    }
+}
+
+void UITask(void *pvParameters)
+{
+    while (true)
+    {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
 void setup()
 {
     auto cfg = M5.config();
@@ -506,35 +564,16 @@ void setup()
     Serial.begin(115200);
     Serial.println("M5Stack nitialized.");
     setConfig();
-    initTempSensers();
+    // initTempSensers();
     LcdInit();
     WiFiInit();
     M5.Display.println("WiFi: OK");
     initNTP();
     M5.Display.println("NTP: OK");
+    xTaskCreatePinnedToCore(loggingTask, "Logging Task", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(UITask, "UI Task", 2048, NULL, 1, NULL, 0);
 }
 
 void loop()
 {
-    M5.update();
-    tryWiFiReconnect = true;
-    float temperature = _getTemp_MCP9600();
-    if (!isnan(temperature))
-    {
-        Serial.print("Temperature: ");
-        Serial.print(temperature);
-        Serial.println(" C");
-    }
-    BitaxeInfo bitaxeInfo = getBitaxeInfo();
-    TempData tempData = getTempData();
-    if (bitaxeInfo.isValid)
-    {
-        storeDB(tempData, bitaxeInfo);
-        storeSDCARD(tempData, bitaxeInfo);
-    }
-    else
-    {
-        printError("Failed to retrieve BitaxeInfo.");
-    }
-    delay(30000);
 }
